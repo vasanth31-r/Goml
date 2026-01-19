@@ -1,27 +1,151 @@
-name: Deploy to AWS
+name: 01 - Bootstrap Terraform Backend
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to bootstrap'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: 'staging'
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: 'plan'
+      confirm_destroy:
+        description: 'Type "destroy" to confirm destruction (only for destroy action)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
-  id-token: write   # REQUIRED for OIDC
+  id-token: write
   contents: read
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: '297834670617'
+  TERRAFORM_VERSION: '1.10.3'
 
+jobs:
+  bootstrap:
+    name: Bootstrap ${{ github.event.inputs.environment }} Backend
+    runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::604264782540:role/Test-role
-          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::297834670617:role/goml-github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Bootstrap-${{ github.event.inputs.environment }}
 
-      - name: Verify AWS access
-        run: aws sts get-caller-identity
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        working-directory: ./bootstrap
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+        working-directory: ./bootstrap
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate
+        working-directory: ./bootstrap
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+        run: |
+          terraform plan \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="aws_account_id=${{ env.AWS_ACCOUNT_ID }}" \
+            -var-file="terraform.tfvars" \
+            -input=false \
+            -no-color
+        working-directory: ./bootstrap
+        continue-on-error: false
+
+      - name: Terraform Apply
+        id: apply
+        if: github.event.inputs.action == 'apply'
+        run: |
+          terraform apply \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="aws_account_id=${{ env.AWS_ACCOUNT_ID }}" \
+            -var-file="terraform.tfvars" \
+            -auto-approve \
+            -input=false
+        working-directory: ./bootstrap
+
+      - name: Validate Destroy Confirmation
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          if [ "${{ github.event.inputs.confirm_destroy }}" != "destroy" ]; then
+            echo "❌ ERROR: Destroy action requires confirmation."
+            echo "Please type 'destroy' in the confirmation field."
+            exit 1
+          fi
+
+      - name: Terraform Destroy
+        id: destroy
+        if: github.event.inputs.action == 'destroy' && github.event.inputs.confirm_destroy == 'destroy'
+        run: |
+          terraform destroy \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="aws_account_id=${{ env.AWS_ACCOUNT_ID }}" \
+            -var-file="terraform.tfvars" \
+            -auto-approve \
+            -input=false
+        working-directory: ./bootstrap
+
+      - name: Output Results
+        if: always()
+        run: |
+          echo "### Bootstrap Workflow Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**AWS Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**AWS Account:** ${{ env.AWS_ACCOUNT_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.apply.outcome }}" == "success" ]; then
+            echo "✅ Bootstrap completed successfully for **${{ github.event.inputs.environment }}**!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**S3 Bucket Created:** goml-terraform-state-297834670617-${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**State File Location:**" >> $GITHUB_STEP_SUMMARY
+            echo "- goml/terraform/${{ github.event.inputs.environment }}/terraform.tfstate" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. You can now deploy infrastructure for ${{ github.event.inputs.environment }} environment" >> $GITHUB_STEP_SUMMARY
+            echo "2. The backend is configured and ready to use" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.destroy.outcome }}" == "success" ]; then
+            echo "✅ Bootstrap destroyed successfully for **${{ github.event.inputs.environment }}**!" >> $GITHUB_STEP_SUMMARY
+          fi
